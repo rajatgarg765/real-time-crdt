@@ -1,0 +1,181 @@
+<!-- index.html -->
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>CRDT Editor - MVP</title>
+    <style>
+      body { font-family: sans-serif; padding: 12px; }
+      textarea { width: 100%; height: 300px; font-size: 16px; }
+    </style>
+  </head>
+  <body>
+    <h3>CRDT Editor (MVP)</h3>
+    <p>Open this page in two windows (different ?user= values) to test realtime.</p>
+    <textarea id="editor" placeholder="Type here..."></textarea>
+
+    <script>
+      // config from URL
+      const params = new URLSearchParams(window.location.search);
+      const docId = params.get('doc') ?? 'doc1';
+      const clientId = params.get('user') ?? ('u' + Math.floor(Math.random()*9999));
+
+      const wsUrl = `ws://${location.hostname}:8000/ws/${docId}?client_id=${encodeURIComponent(clientId)}`;
+      const ws = new WebSocket(wsUrl);
+
+      const editor = document.getElementById('editor');
+
+      // local CRDT mirror (array of {id,char,visible})
+      let localChars = [];
+      let oldText = "";
+
+      // temp id counter for optimistic inserts
+      let tmpCounter = 1;
+
+      function getVisibleText() {
+        return localChars.filter(c => c.visible).map(c => c.char).join('');
+      }
+
+      function renderToEditor() {
+        const text = getVisibleText();
+        // naive render (we don't attempt to preserve selection in this MVP)
+        editor.value = text;
+        oldText = text;
+      }
+
+      function findVisibleIndexByPosition(visiblePos) {
+        // return index into localChars that corresponds to visible position (0-based)
+        let count = 0;
+        for (let i = 0; i < localChars.length; i++) {
+          if (!localChars[i].visible) continue;
+          if (count === visiblePos) return i;
+          count++;
+        }
+        return -1;
+      }
+
+      function getIdAtVisiblePosition(visiblePos) {
+        if (visiblePos < 0) return null;
+        const idx = findVisibleIndexByPosition(visiblePos);
+        return idx === -1 ? null : localChars[idx].id;
+      }
+
+      // Apply remote insert op
+      function applyRemoteInsert(op) {
+        // If this insert corresponds to an optimistic client op, replace the temp id
+        if (op.client_op_id) {
+          const tmpIdx = localChars.findIndex(c => c.id === op.client_op_id);
+          if (tmpIdx !== -1) {
+            // replace temp id with server id
+            localChars[tmpIdx].id = op.id;
+            return;
+          }
+        }
+
+        // otherwise merge as new char
+        const newEntry = { id: op.id, char: op.char, visible: true };
+
+        if (!op.after) {
+          localChars.splice(0, 0, newEntry);
+        } else {
+          const idx = localChars.findIndex(c => c.id === op.after);
+          if (idx === -1) {
+            localChars.push(newEntry);
+          } else {
+            localChars.splice(idx + 1, 0, newEntry);
+          }
+        }
+      }
+
+      function applyRemoteDelete(op) {
+        const idx = localChars.findIndex(c => c.id === op.id);
+        if (idx !== -1) {
+          localChars[idx].visible = false;
+        }
+      }
+
+      ws.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'snapshot') {
+          // build localChars from snapshot (ordered)
+          localChars = msg.chars.map(c => ({ id: c.id, char: c.char, visible: c.visible }));
+          renderToEditor();
+        } else if (msg.type === 'insert') {
+          applyRemoteInsert(msg);
+          renderToEditor();
+        } else if (msg.type === 'delete') {
+          applyRemoteDelete(msg);
+          renderToEditor();
+        } else if (msg.type === 'error') {
+          console.error("server error:", msg.msg);
+        }
+      };
+
+      // compute naive diff for simple edits (single contiguous insert/delete)
+      function computeDiff(a, b) {
+        let i = 0;
+        while (i < a.length && i < b.length && a[i] === b[i]) i++;
+        if (a === b) return [];
+        // insertion
+        if (a.length < b.length) {
+          const inserted = b.slice(i, b.length - (a.length - i));
+          return [{ type: 'insert', pos: i, text: inserted }];
+        } else {
+          // deletion
+          const deletedCount = a.length - b.length;
+          return [{ type: 'delete', pos: i, count: deletedCount }];
+        }
+      }
+
+      editor.addEventListener('input', () => {
+        const newText = editor.value;
+        const diffs = computeDiff(oldText, newText);
+        if (!diffs || diffs.length === 0) { oldText = newText; return; }
+
+        for (const d of diffs) {
+          if (d.type === 'insert') {
+            // insert each character sequentially at position d.pos
+            for (let k = 0; k < d.text.length; k++) {
+              const ch = d.text[k];
+              const pos = d.pos + k; // position among visible chars where this new char should go
+              const afterId = pos === 0 ? null : getIdAtVisiblePosition(pos - 1);
+              // create a temporary client op id and optimistic local insert
+              const client_op_id = `tmp-${clientId}-${tmpCounter++}`;
+              // optimistic local insertion (temp id)
+              if (!afterId) {
+                localChars.splice(0, 0, { id: client_op_id, char: ch, visible: true });
+              } else {
+                const idx = localChars.findIndex(c => c.id === afterId);
+                if (idx === -1) {
+                  localChars.push({ id: client_op_id, char: ch, visible: true });
+                } else {
+                  localChars.splice(idx + 1, 0, { id: client_op_id, char: ch, visible: true });
+                }
+              }
+
+              ws.send(JSON.stringify({
+                type: 'insert',
+                char: ch,
+                after: afterId,
+                client_op_id: client_op_id
+              }));
+            }
+          } else if (d.type === 'delete') {
+            // delete d.count chars starting at visible position d.pos
+            for (let k = 0; k < d.count; k++) {
+              const visiblePos = d.pos; // after deleting one, the next to delete is at same visible pos
+              const idx = findVisibleIndexByPosition(visiblePos);
+              if (idx === -1) continue;
+              const idToDelete = localChars[idx].id;
+              // optimistic
+              localChars[idx].visible = false;
+              ws.send(JSON.stringify({ type: 'delete', id: idToDelete }));
+            }
+          }
+        }
+        // update local snapshot
+        oldText = newText;
+      });
+    </script>
+  </body>
+</html>
