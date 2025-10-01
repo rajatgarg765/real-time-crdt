@@ -61,25 +61,33 @@ class DocumentManager:
     # holds document in memory and connected through websocket per doc_id
 
     def __init__(self):
-        # doc_id -> {"doc": CRDTDocument, "sockets": set(WebSocket)}
+        # doc_id -> {"doc": CRDTDocument, "sockets": set(WebSocket), "clients": {client_id: {"username": str, "cursor": int}}}
+
         self.docs: Dict[str, Dict] = {}
 
     def ensure_doc(self, doc_id):
         if doc_id not in self.docs:
-            self.docs[doc_id] = {"doc": CRDTDocument(), "sockets": set()}
+            self.docs[doc_id] = {"doc": CRDTDocument(), "sockets": set(), "clients": {}}
 
-    async def connect(self, doc_id, websocket: WebSocket):
+    async def connect(self, doc_id, websocket: WebSocket, client_id: str,  username: str):
         self.ensure_doc(doc_id)
         self.docs[doc_id]["sockets"].add(websocket)
+        self.docs[doc_id]["clients"][client_id] = {"username": username, "cursor": 0}
+        await self.broadcast_users(doc_id)
 
-    async def disconnet(self, doc_id, websocket: WebSocket):
-        if doc_id in self.docs and websocket in self.docs[doc_id]['sockets']:
-            self.docs[doc_id]['sockets'].remove(websocket)
+    async def disconnect(self, doc_id, websocket: WebSocket, client_id: str):
+        if doc_id in self.docs:
+            if websocket in self.docs[doc_id]['sockets']:
+                self.docs[doc_id]['sockets'].remove(websocket)
+            if client_id in self.docs[doc_id]['clients']:
+                del self.docs[doc_id]['clients'][client_id]
 
             # cleanup if no clients remain
             if not self.docs[doc_id]['sockets']:
                 # Optional: keep doc in memory or persist; here we keep it
                 pass
+
+            await self.broadcast_users(doc_id)
 
     async def broadcast(self, doc_id, message):
         """
@@ -98,17 +106,26 @@ class DocumentManager:
             except Exception:
                 to_remove.append(ws)
         for ws in to_remove:
-            await self.disconnet(doc_id, ws)
+            await self.disconnect(doc_id, ws, "")
+
+    async def broadcast_users(self, doc_id):
+        users = [
+            {"id": cid, "username": meta["username"], "cursor": meta["cursor"]}
+            for cid, meta in self.docs[doc_id]["clients"].items()
+        ]
+        await self.broadcast(doc_id, {"type": "user_list", "users": users})
 
 
 manager = DocumentManager()
 
 
 @app.websocket("/ws/{doc_id}")
-async def websocket_endpoint(websocket: WebSocket, doc_id, client_id: Optional[str] = Query(None)):
+async def websocket_endpoint(
+    websocket: WebSocket, doc_id, client_id: Optional[str] = Query(None), username: Optional[str] = Query("Anonymous")
+):
 
     await websocket.accept()
-    await manager.connect(doc_id, websocket)
+    await manager.connect(doc_id, websocket, client_id, username)
 
     # send initial snapshot
     snapshot = manager.docs[doc_id]["doc"].to_snapshot()
@@ -151,11 +168,24 @@ async def websocket_endpoint(websocket: WebSocket, doc_id, client_id: Optional[s
                 manager.docs[doc_id]["doc"].merge_delete(del_id)
                 await manager.broadcast(doc_id, op)
 
+            elif mtype == "cursor":
+                # client sends: {type: "cursor", position: int}
+                pos = msg.get("position", 0)
+                if client_id in manager.docs[doc_id]["clients"]:
+                    manager.docs[doc_id]["clients"][client_id]["cursor"] = pos
+
+                await manager.broadcast(doc_id, {
+                    "type": "cursor",
+                    "user_id": client_id,
+                    "username": username,
+                    "position": pos
+                })
+
             else:
                 # unknown type - ignore or log
                 await websocket.send_json({"type": "error", "msg": "unknown message type"})
     except WebSocketDisconnect:
-        await manager.disconnect(doc_id, websocket)
+        await manager.disconnect(doc_id, websocket, client_id)
     except Exception:
-        await manager.disconnect(doc_id, websocket)
+        await manager.disconnect(doc_id, websocket, client_id)
         raise
