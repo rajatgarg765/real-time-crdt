@@ -27,6 +27,13 @@ async def save_snapshot(doc_id):
         """, doc_id, snapshot_json)
 
 
+async def init_db():
+    async with db_pool.acquire() as conn:
+        with open("db_init/init.sql", "r") as f:
+            schema_sql = f.read()
+        await conn.execute(schema_sql)
+
+
 async def load_snapshots():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT doc_id, snapshot FROM documents")
@@ -234,6 +241,7 @@ async def websocket_endpoint(
 async def startup():
     global db_pool
     db_pool = await asyncpg.create_pool(dsn=DB_DSN)
+    await init_db()         # <-- ensure tables exist
     await load_snapshots()
     asyncio.create_task(periodic_snapshot())
 
