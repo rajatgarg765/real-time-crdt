@@ -1,9 +1,47 @@
 import asyncio
+import asyncpg
+import json
 import uuid
+import os
+from fastapi.responses import HTMLResponse, JSONResponse
 from typing import List, Optional, Dict
+from fastapi.staticfiles import StaticFiles
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 
+DB_DSN = os.getenv("DATABASE_URL", "postgres://crdtuser:crdtpass@localhost:5432/crdtdb")
+db_pool = None  # will hold connection pool
+
 app = FastAPI()
+
+
+async def save_snapshot(doc_id):
+    if doc_id not in manager.docs:
+        return
+    doc = manager.docs[doc_id]["doc"]
+    snapshot_json = json.dumps(doc.to_snapshot())
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO documents (doc_id, snapshot)
+            VALUES ($1, $2)
+            ON CONFLICT (doc_id) DO UPDATE SET snapshot = $2, updated_at = now()
+        """, doc_id, snapshot_json)
+
+
+async def load_snapshots():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT doc_id, snapshot FROM documents")
+        for row in rows:
+            manager.ensure_doc(row["doc_id"])
+            snapshot = json.loads(row["snapshot"])
+            doc = manager.docs[row["doc_id"]]["doc"]
+            doc.chars = [CRDTChar(c["id"], c["char"], c["visible"]) for c in snapshot]
+
+
+async def periodic_snapshot(interval=5):
+    while True:
+        for doc_id in manager.docs.keys():
+            await save_snapshot(doc_id)
+        await asyncio.sleep(interval)
 
 
 class CRDTChar:
@@ -159,6 +197,7 @@ async def websocket_endpoint(
 
                 # broadcast to all clients (including sender)
                 await manager.broadcast(doc_id, op)
+                await save_snapshot(doc_id)  # optional immediate persist
 
             elif mtype == "delete":
                 # client sends: {type:'delete', id: <server-assigned-id>}
@@ -189,3 +228,31 @@ async def websocket_endpoint(
     except Exception:
         await manager.disconnect(doc_id, websocket, client_id)
         raise
+
+
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    db_pool = await asyncpg.create_pool(dsn=DB_DSN)
+    await load_snapshots()
+    asyncio.create_task(periodic_snapshot())
+
+
+DOCS = [
+    {"id": "doc1", "title": "Project Plan"},
+    {"id": "doc2", "title": "Design Notes"},
+    {"id": "doc3", "title": "Team Meeting"},
+]
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    with open("static/home.html") as f:
+        return f.read()
+
+
+@app.get("/api/docs", response_class=JSONResponse)
+async def list_docs():
+    return DOCS

@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>CRDT Docs</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        padding: 20px;
+        max-width: 600px;
+        margin: auto;
+      }
+      input, button {
+        padding: 8px;
+        font-size: 16px;
+      }
+      ul {
+        list-style: none;
+        padding: 0;
+      }
+      li {
+        background: #f0f0f0;
+        margin: 8px 0;
+        padding: 10px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: background 0.2s;
+      }
+      li:hover {
+        background: #e0e0e0;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>Welcome to CRDT Docs</h2>
+
+    <div id="loginSection">
+      <p>Enter your name to start:</p>
+      <input id="username" placeholder="Your name" />
+      <button onclick="enterApp()">Continue</button>
+    </div>
+
+    <div id="docsSection" style="display:none;">
+      <h3>Select a document to edit:</h3>
+      <ul id="docsList"></ul>
+    </div>
+
+    <script>
+      let username = null;
+
+      function enterApp() {
+        const input = document.getElementById("username").value.trim();
+        if (!input) {
+          alert("Please enter your name.");
+          return;
+        }
+        username = input;
+        document.getElementById("loginSection").style.display = "none";
+        document.getElementById("docsSection").style.display = "block";
+        loadDocs();
+      }
+
+      async function loadDocs() {
+        const resp = await fetch("/api/docs");
+        const docs = await resp.json();
+        const list = document.getElementById("docsList");
+        list.innerHTML = "";
+        docs.forEach(doc => {
+          const li = document.createElement("li");
+          li.textContent = doc.title;
+          li.onclick = () => {
+            window.location.href = `/static/editor.html?doc=${doc.id}&name=${encodeURIComponent(username)}`;
+          };
+          list.appendChild(li);
+        });
+      }
+    </script>
+  </body>
+</html>

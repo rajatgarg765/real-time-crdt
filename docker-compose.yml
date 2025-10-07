@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: crdt-postgres
+    environment:
+      POSTGRES_USER: crdtuser
+      POSTGRES_PASSWORD: crdtpass
+      POSTGRES_DB: crdtdb
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data   # persistent DB storage
+      - ./db_init:/docker-entrypoint-initdb.d  # init scripts
+    ports:
+      - "5434:5432"
+
+  fastapi:
+    build:
+      context: /opt/infilect/dev/repos/real-time-crdt
+      dockerfile: Dockerfile
+    container_name: crdt-fastapi
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - /opt/infilect/dev/repos/real-time-crdt:/opt/infilect/dev/repos/real-time-crdt
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://crdtuser:crdtpass@postgres:5432/crdtdb
